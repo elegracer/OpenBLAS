@@ -6,6 +6,14 @@ cmake_minimum_required(VERSION 2.8.5)
 
 project(OpenBLAS C ASM)
 
+find_program(CCACHE ccache)
+if(CCACHE)
+    message(STATUS "ccache found")
+    set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE})
+else()
+    message(STATUS "ccache not found")
+endif()
+
 set(OpenBLAS_MAJOR_VERSION 0)
 set(OpenBLAS_MINOR_VERSION 3)
 set(OpenBLAS_PATCH_VERSION 27)
@@ -300,7 +308,7 @@ endforeach()
 
 enable_testing()
 
-if (USE_THREAD)
+# if (USE_THREAD)
   # Add threading library to linker
   find_package(Threads)
   if (THREADS_HAVE_PTHREAD_ARG)
@@ -315,7 +323,7 @@ if (USE_THREAD)
   if(BUILD_SHARED_LIBS)
     target_link_libraries(${OpenBLAS_LIBNAME}_shared ${CMAKE_THREAD_LIBS_INIT})
   endif()
-endif()
+# endif()
 
 #if (MSVC OR NOT NOFORTRAN)
 if (NOT NO_CBLAS)

@@ -73,6 +73,9 @@ USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "common.h"
 
+#include <threads.h>
+#include <pthread.h>
+
 #define NEW_BUFFERS 512
 #ifndef likely
 #ifdef __GNUC__
@@ -1319,7 +1322,7 @@ UNLOCK_COMMAND(&alloc_lock);
   printf("with a larger NUM_THREADS value or set the environment variable OPENBLAS_NUM_THREADS to\n");
   printf("a sufficiently small number. This error typically occurs when the software that relies on\n");
   printf("OpenBLAS calls BLAS functions from many threads in parallel, or when your computer has more\n");
-  printf("cpu cores than what OpenBLAS was configured to handle.\n"); 
+  printf("cpu cores than what OpenBLAS was configured to handle.\n");
 
   return NULL;
 }
@@ -1806,7 +1809,7 @@ int get_num_procs(void) {
 
   static int nums = 0;
   int ret;
-	
+
 #if defined(__GLIBC_PREREQ)
   cpu_set_t cpuset,*cpusetp;
   size_t size;
@@ -1836,7 +1839,7 @@ int get_num_procs(void) {
 #if !defined(OS_LINUX)
   return (nums > 0 ? nums :2);
 #endif
-	
+
 #if !defined(__GLIBC_PREREQ)
   return (nums > 0 ? nums :2);
 #else
@@ -2259,7 +2262,7 @@ static void *alloc_mmap(void *address){
 #endif
 #endif
 
-#ifdef BUILD_DOUBLE 
+#ifdef BUILD_DOUBLE
 	allocsize = DGEMM_P * DGEMM_Q * sizeof(double);
 #elif defined(BUILD_COMPLEX16)
 	allocsize = ZGEMM_P * ZGEMM_Q * sizeof(double);
@@ -2722,7 +2725,7 @@ static volatile struct {
 
 } memory[NUM_BUFFERS];
 
-struct newmemstruct 
+struct newmemstruct
 {
   BLASULONG lock;
   void *addr;
@@ -2747,10 +2750,99 @@ static int memory_overflowed = 0;
 /*                1 : Level 2 functions      */
 /*                2 : Thread                 */
 
+#define MAX_NUM_PERSISTENT_ALLOCATE_BLOCK 2
+#define MAX_NUM_ALLOCATE_BLOCK 8
+struct thread_local_memory_t {
+  void* allocated_memory[MAX_NUM_ALLOCATE_BLOCK];
+  int num_allocated_persistent_block;
+  int num_used_block; // >= num_allocated_persistent_block
+};
+// thread_local struct thread_local_memory_t* thread_local_memory = NULL;
+thread_local pthread_key_t key;
+thread_local pthread_once_t key_once = PTHREAD_ONCE_INIT;
+
+void thread_local_memory_destructor(void* ptr) {
+  struct thread_local_memory_t* ptr_tlm = ptr;
+  for (int i = 0; i < ptr_tlm->num_allocated_persistent_block; ++i) {
+    // free(ptr_tlm->allocated_memory[i]);
+    munmap(ptr_tlm->allocated_memory[i], BUFFER_SIZE + FIXED_PAGESIZE);
+    fprintf(stdout, "freed persistent block %d %p in destructor\n", i, ptr_tlm->allocated_memory[i]);
+  }
+}
+
+void thread_local_memory_atexit_cleanup() {
+  void* ptr = pthread_getspecific(key);
+  if (ptr != NULL) {
+    thread_local_memory_destructor(ptr);
+    pthread_setspecific(key, NULL);
+  }
+}
+
+void thread_local_memory_make_key() {
+  pthread_key_create(&key, thread_local_memory_destructor);
+  fprintf(stdout, "created thread key %u in constructor\n", key);
+  atexit(thread_local_memory_atexit_cleanup);
+}
+
+
+#include <unistd.h>
+#include <sys/syscall.h>
+
+int get_thread_id() {
+#if defined(__linux__)
+    return syscall(SYS_gettid);
+#elif defined(__FreeBSD__)
+    long tid;
+    thr_self(&tid);
+    return (int)tid;
+#elif defined(__NetBSD__)
+    return _lwp_self();
+#elif defined(__OpenBSD__)
+    return getthrid();
+#else
+    return getpid();
+#endif
+}
+
 void *blas_memory_alloc(int procpos){
 
+  pthread_once(&key_once, thread_local_memory_make_key);
+  struct thread_local_memory_t* ptr_tlm;
+  if ((ptr_tlm = pthread_getspecific(key)) == NULL) {
+    ptr_tlm = malloc(sizeof(struct thread_local_memory_t));
+    ptr_tlm->num_allocated_persistent_block = 0;
+    ptr_tlm->num_used_block = 0;
+    pthread_setspecific(key, ptr_tlm);
+  }
+
+  if (ptr_tlm->num_used_block >= MAX_NUM_ALLOCATE_BLOCK) {
+    fprintf(stderr, "tid: %d, allocated more than %d memory! overflow!\n", get_thread_id(), MAX_NUM_ALLOCATE_BLOCK);
+    return NULL;
+  } else if (ptr_tlm->num_used_block < ptr_tlm->num_allocated_persistent_block) {
+    fprintf(stdout, "tid: %d, use persistent block %d: %p!\n", get_thread_id(), ptr_tlm->num_used_block, ptr_tlm->allocated_memory[ptr_tlm->num_used_block]);
+    ++ptr_tlm->num_used_block;
+    return ptr_tlm->allocated_memory[ptr_tlm->num_used_block - 1];
+  } else if (ptr_tlm->num_allocated_persistent_block >= MAX_NUM_PERSISTENT_ALLOCATE_BLOCK) {
+    // ptr_tlm->allocated_memory[ptr_tlm->num_used_block] = malloc(BUFFER_SIZE + FIXED_PAGESIZE);
+    ptr_tlm->allocated_memory[ptr_tlm->num_used_block] = mmap(NULL, BUFFER_SIZE + FIXED_PAGESIZE, MMAP_ACCESS, MMAP_POLICY, -1, 0);
+    fprintf(stdout, "tid: %d, allocate memory block %d: %p!\n", get_thread_id(), ptr_tlm->num_used_block, ptr_tlm->allocated_memory[ptr_tlm->num_used_block]);
+    ++ptr_tlm->num_used_block;
+    return ptr_tlm->allocated_memory[ptr_tlm->num_used_block - 1];
+  } else if (ptr_tlm->num_used_block == ptr_tlm->num_allocated_persistent_block) {  /* num_allocated_persistent_block < MAX_NUM_PERSISTENT_ALLOCATE_BLOCK */
+    /* ptr_tlm->num_used_block == num_allocated_persistent_block */
+    // ptr_tlm->allocated_memory[num_allocated_persistent_block] = malloc(BUFFER_SIZE + FIXED_PAGESIZE);
+    ptr_tlm->allocated_memory[ptr_tlm->num_used_block] = mmap(NULL, BUFFER_SIZE + FIXED_PAGESIZE, MMAP_ACCESS, MMAP_POLICY, -1, 0);
+    fprintf(stderr, "tid: %d, allocate persistent memory block %d: %p!\n", get_thread_id(), ptr_tlm->num_allocated_persistent_block, ptr_tlm->allocated_memory[ptr_tlm->num_allocated_persistent_block]);
+    ++ptr_tlm->num_allocated_persistent_block;
+    ++ptr_tlm->num_used_block;
+    return ptr_tlm->allocated_memory[ptr_tlm->num_allocated_persistent_block - 1];
+  } else {
+    fprintf(stderr, "impossible branch! ptr_thread_local_memory->num_used_block: %d, num_allocated_persistent_block: %d\n", ptr_tlm->num_used_block, ptr_tlm->num_allocated_persistent_block);
+    exit(EXIT_FAILURE);
+  }
+
   int i;
-  
+
   int position;
 #if defined(WHEREAMI) && !defined(USE_OPENMP)
   int mypos = 0;
@@ -3026,7 +3118,7 @@ void *blas_memory_alloc(int procpos){
   newmemory[i].used   = 0;
   newmemory[i].lock   = 0;
 }
-  
+
 allocation2:
   newmemory[position-NUM_BUFFERS].used = 1;
 #if (defined(SMP) || defined(USE_LOCKING)) && !defined(USE_OPENMP)
@@ -3105,11 +3197,40 @@ terminate:
   printf("with a larger NUM_THREADS value or set the environment variable OPENBLAS_NUM_THREADS to\n");
   printf("a sufficiently small number. This error typically occurs when the software that relies on\n");
   printf("OpenBLAS calls BLAS functions from many threads in parallel, or when your computer has more\n");
-  printf("cpu cores than what OpenBLAS was configured to handle.\n"); 
+  printf("cpu cores than what OpenBLAS was configured to handle.\n");
   return NULL;
 }
 
 void blas_memory_free(void *free_area){
+
+  pthread_once(&key_once, thread_local_memory_make_key);
+  struct thread_local_memory_t* ptr_tlm;
+  if ((ptr_tlm = pthread_getspecific(key)) == NULL) {
+    ptr_tlm = malloc(sizeof(struct thread_local_memory_t));
+    ptr_tlm->num_allocated_persistent_block = 0;
+    ptr_tlm->num_used_block = 0;
+    pthread_setspecific(key, ptr_tlm);
+  }
+
+  if (ptr_tlm->num_used_block <= 0) {
+    fprintf(stderr, "tid: %d, no used memory block!\n", get_thread_id());
+    return;
+  } else if (ptr_tlm->num_used_block > ptr_tlm->num_allocated_persistent_block) {
+    if (ptr_tlm->num_allocated_persistent_block >= MAX_NUM_PERSISTENT_ALLOCATE_BLOCK) {
+      --ptr_tlm->num_used_block;
+      fprintf(stdout, "tid: %d, free allocated memory block %d: %p!\n", get_thread_id(), ptr_tlm->num_used_block, ptr_tlm->allocated_memory[ptr_tlm->num_used_block]);
+      // free(ptr_tlm->allocated_memory[ptr_tlm->num_used_block]);
+      munmap(ptr_tlm->allocated_memory[ptr_tlm->num_used_block], BUFFER_SIZE + FIXED_PAGESIZE);
+      return;
+    } else {
+      fprintf(stderr, "tid: %d, impossible branch!\n", get_thread_id());
+      exit(EXIT_FAILURE);
+    }
+  } else {
+    --ptr_tlm->num_used_block;
+    fprintf(stdout, "tid: %d, leave persistent block %d not freed for later use!\n", get_thread_id(), ptr_tlm->num_used_block);
+    return;
+  }
 
   int position;
 
@@ -3225,7 +3346,7 @@ void blas_shutdown(void){
     }
     free(newmemory);
     newmemory = NULL;
-    memory_overflowed = 0;  
+    memory_overflowed = 0;
   }
 
   UNLOCK_COMMAND(&alloc_lock);
